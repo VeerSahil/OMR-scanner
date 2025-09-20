@@ -1,1 +1,200 @@
-This is my first hachathon
+import streamlit as st
+import cv2
+import numpy as np
+import pandas as pd
+import re
+
+# A helper function to read the specific CSV format
+def read_answer_key_from_file(file):
+    try:
+        df = pd.read_csv(file, header=None)
+        
+        all_answers = []
+        
+        start_row = 0
+        for i, row in df.iterrows():
+            if '1 - ' in str(row.iloc[0]):
+                start_row = i
+                break
+        
+        df = df.iloc[start_row:].copy()
+        
+        answer_pairs = []
+        for col in df.columns:
+            column_answers_series = df[col].dropna()
+            
+            for item in column_answers_series:
+                # Updated regex to handle both '-' and '.'
+                match = re.search(r'^(\d+)\s*[-.]\s*([a-z])', str(item).lower())
+                if match:
+                    q_num = int(match.group(1))
+                    answer_letter = match.group(2)
+                    answer_value = ord(answer_letter) - ord('a')
+                    answer_pairs.append((q_num, answer_value))
+        
+        answer_pairs.sort(key=lambda x: x[0])
+        
+        sorted_answers = [ans for q_num, ans in answer_pairs]
+        
+        return sorted_answers
+    
+    except Exception as e:
+        st.error(f"Error reading answer key from file: {e}")
+        return None
+
+def preprocess_omr_sheet(student_image, template_image):
+    """
+    Aligns the student's OMR sheet to a blank template using feature matching (ORB).
+    """
+    # Initialize ORB detector
+    orb = cv2.ORB_create(nfeatures=5000)
+
+    # Find the keypoints and descriptors with ORB
+    kp1, des1 = orb.detectAndCompute(template_image, None)
+    kp2, des2 = orb.detectAndCompute(student_image, None)
+
+    # Create BFMatcher object
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    # Match descriptors
+    matches = bf.match(des1, des2)
+
+    # Sort them in the order of their distance
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    # Extract the top 50 matches
+    matches = matches[:50]
+
+    # Draw top matches for debugging
+    # img3 = cv2.drawMatches(template_image, kp1, student_image, kp2, matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    # st.image(img3, caption="Feature Matches", use_column_width=True)
+
+    # Get the keypoints from the matches
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    # Find the Homography matrix
+    M, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+
+    if M is None:
+        return None
+
+    # Get the dimensions of the template image
+    h, w, _ = template_image.shape
+
+    # Warp the student image to align with the template
+    aligned_image = cv2.warpPerspective(student_image, M, (w, h))
+
+    return aligned_image
+
+def detect_and_score_omr(aligned_image, answer_key):
+    """
+    Detects bubbles, determines marked answers, and scores the sheet using fixed coordinates.
+    This assumes a fixed OMR layout from a template.
+    """
+    gray_image = cv2.cvtColor(aligned_image, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+
+    # Hardcoded coordinates for the main OMR bubble area
+    # These coordinates are based on the template, so they are fixed
+    omr_area_x, omr_area_y, omr_area_w, omr_area_h = 100, 100, 700, 850
+
+    omr_roi = thresh[omr_area_y:omr_area_y+omr_area_h, omr_area_x:omr_area_x+omr_area_w]
+
+    # Define the grid based on the number of questions and options
+    num_questions = 80
+    num_options = 5
+    num_columns = 2
+    
+    # Calculate the size of each grid cell (bubble)
+    cell_width = omr_roi.shape[1] // (num_options * num_columns)
+    cell_height = omr_roi.shape[0] // (num_questions // num_columns)
+
+    student_answers = []
+    
+    for i in range(num_questions):
+        question_answers = []
+        for j in range(num_options):
+            
+            col = i // (num_questions // num_columns)
+            row = i % (num_questions // num_columns)
+
+            x_start = j * cell_width + col * (omr_roi.shape[1] // num_columns)
+            y_start = row * cell_height
+            
+            bubble_region = omr_roi[y_start:y_start+cell_height, x_start:x_start+cell_width]
+            
+            if bubble_region.size > 0:
+                filled_pixels = cv2.countNonZero(bubble_region)
+                question_answers.append(filled_pixels)
+            else:
+                question_answers.append(0)
+
+        marked_bubble = None
+        if max(question_answers) > 50:
+            marked_bubble = np.argmax(question_answers)
+
+        student_answers.append(marked_bubble)
+    
+    score = 0
+    total_questions = len(answer_key)
+    
+    for i in range(total_questions):
+        if i < len(student_answers) and student_answers[i] == answer_key[i]:
+            score += 1
+            
+    return score, student_answers
+
+
+# --- Streamlit Frontend UI ---
+st.title("Automated OMR Evaluation & Scoring System")
+
+st.markdown("""
+Welcome to the OMR Evaluation System!
+Please upload both the answer key, a blank OMR template, and the student's OMR sheet.
+""")
+
+answer_key_file = st.file_uploader("1. Choose the Answer Key file (CSV format)...", type=["csv"])
+template_file = st.file_uploader("2. Upload a **blank OMR sheet photo/scan** (Template)", type=["jpg", "jpeg", "png"])
+omr_sheet_file = st.file_uploader("3. Choose a student's OMR sheet image...", type=["jpg", "jpeg", "png"])
+
+if answer_key_file is None or template_file is None or omr_sheet_file is None:
+    st.warning("Please upload all three files to continue.")
+else:
+    st.write("---")
+    st.write("Processing files...")
+
+    try:
+        answer_key = read_answer_key_from_file(answer_key_file)
+        
+        if answer_key is None:
+            st.error("The answer key could not be processed. Please check the file format.")
+        else:
+            template_bytes = np.asarray(bytearray(template_file.read()), dtype=np.uint8)
+            template_image = cv2.imdecode(template_bytes, 1)
+
+            omr_bytes = np.asarray(bytearray(omr_sheet_file.read()), dtype=np.uint8)
+            omr_image = cv2.imdecode(omr_bytes, 1)
+
+            st.image(omr_image, caption='Uploaded Student OMR Sheet', use_column_width=True)
+            st.write("---")
+            
+            aligned_image = preprocess_omr_sheet(omr_image, template_image)
+            
+            if aligned_image is not None:
+                st.image(aligned_image, caption='Aligned and Corrected Image', use_column_width=True)
+
+                score, answers = detect_and_score_omr(aligned_image, answer_key)
+                
+                st.success("Processing complete!")
+                st.write("---")
+                st.subheader("Results")
+                st.write(f"**Total Score:** {score} out of {len(answer_key)}")
+                
+                st.write("Student Answers:", answers)
+                
+            else:
+                st.error("Could not align the images. Please ensure the template and student sheet are from the same batch.")
+            
+    except Exception as e:
+        st.error(f"An error occurred during processing: {e}")
