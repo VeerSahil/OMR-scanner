@@ -3,198 +3,389 @@ import cv2
 import numpy as np
 import pandas as pd
 import re
+import sqlite3
 
-# A helper function to read the specific CSV format
+# --- Streamlit Page Config ---
+st.set_page_config(
+    page_title="OMR Evaluation System",
+    page_icon="📝",
+    layout="wide",
+)
+
+# --- Custom CSS for Styling ---
+st.markdown("""
+<style>
+    .main {
+        background-color: #f9fafb;
+    }
+    .stAlert {
+        border-radius: 12px !important;
+    }
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    .score-card {
+        background-color: white;
+        padding: 20px;
+        border-radius: 15px;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+    .score-title {
+        font-size: 18px;
+        font-weight: 600;
+        color: #374151;
+    }
+    .score-value {
+        font-size: 24px;
+        font-weight: 700;
+        color: #2563eb;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- Database Setup (SQLite) ---
+DB_FILE = "omr_results.db"
+
+def get_db_connection():
+    return sqlite3.connect(DB_FILE)
+
+def create_table_if_not_exists(conn, cursor):
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS omr_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        student_id TEXT NOT NULL,
+        total_score INTEGER NOT NULL,
+        python_score INTEGER,
+        data_analysis_score INTEGER,
+        mysql_score INTEGER,
+        power_bi_score INTEGER,
+        adv_stats_score INTEGER,
+        image_path TEXT
+    );
+    """)
+    conn.commit()
+
+def insert_result(conn, cursor, student_id, total_score, subject_scores, image_path):
+    insert_query = """
+    INSERT INTO omr_results 
+    (student_id, total_score, python_score, data_analysis_score, mysql_score, power_bi_score, adv_stats_score, image_path)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    data = (
+        student_id,
+        total_score,
+        subject_scores[0],
+        subject_scores[1],
+        subject_scores[2],
+        subject_scores[3],
+        subject_scores[4],
+        image_path
+    )
+    cursor.execute(insert_query, data)
+    conn.commit()
+    st.success("✅ Result saved successfully!")
+
+# --- Answer Key Reader ---
 def read_answer_key_from_file(file):
     try:
         df = pd.read_csv(file, header=None)
-        
-        all_answers = []
-        
         start_row = 0
         for i, row in df.iterrows():
             if '1 - ' in str(row.iloc[0]):
                 start_row = i
                 break
-        
         df = df.iloc[start_row:].copy()
-        
         answer_pairs = []
         for col in df.columns:
-            column_answers_series = df[col].dropna()
-            
-            for item in column_answers_series:
-                # Updated regex to handle both '-' and '.'
+            for item in df[col].dropna():
                 match = re.search(r'^(\d+)\s*[-.]\s*([a-z])', str(item).lower())
                 if match:
                     q_num = int(match.group(1))
-                    answer_letter = match.group(2)
-                    answer_value = ord(answer_letter) - ord('a')
-                    answer_pairs.append((q_num, answer_value))
-        
+                    ans_val = ord(match.group(2)) - ord('a')
+                    answer_pairs.append((q_num, ans_val))
         answer_pairs.sort(key=lambda x: x[0])
-        
-        sorted_answers = [ans for q_num, ans in answer_pairs]
-        
-        return sorted_answers
-    
+        return [ans for _, ans in answer_pairs]
     except Exception as e:
-        st.error(f"Error reading answer key from file: {e}")
+        st.error(f"⚠️ Error reading answer key: {e}")
         return None
 
-def preprocess_omr_sheet(student_image, template_image):
-    """
-    Aligns the student's OMR sheet to a blank template using feature matching (ORB).
-    """
-    # Initialize ORB detector
-    orb = cv2.ORB_create(nfeatures=5000)
-
-    # Find the keypoints and descriptors with ORB
-    kp1, des1 = orb.detectAndCompute(template_image, None)
-    kp2, des2 = orb.detectAndCompute(student_image, None)
-
-    # Create BFMatcher object
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
-    # Match descriptors
-    matches = bf.match(des1, des2)
-
-    # Sort them in the order of their distance
-    matches = sorted(matches, key=lambda x: x.distance)
-
-    # Extract the top 50 matches
-    matches = matches[:50]
-
-    # Draw top matches for debugging
-    # img3 = cv2.drawMatches(template_image, kp1, student_image, kp2, matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-    # st.image(img3, caption="Feature Matches", use_column_width=True)
-
-    # Get the keypoints from the matches
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-
-    # Find the Homography matrix
-    M, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
-
-    if M is None:
-        return None
-
-    # Get the dimensions of the template image
-    h, w, _ = template_image.shape
-
-    # Warp the student image to align with the template
-    aligned_image = cv2.warpPerspective(student_image, M, (w, h))
-
-    return aligned_image
+# --- Image Preprocessing ---
+def preprocess_omr_sheet(student_image):
+    return student_image
 
 def detect_and_score_omr(aligned_image, answer_key):
-    """
-    Detects bubbles, determines marked answers, and scores the sheet using fixed coordinates.
-    This assumes a fixed OMR layout from a template.
-    """
-    gray_image = cv2.cvtColor(aligned_image, cv2.COLOR_BGR2GRAY)
-    thresh = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    """Contour-based bubble detection per ROI with fallback to grid slicing."""
+    gray = cv2.cvtColor(aligned_image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
 
-    # Hardcoded coordinates for the main OMR bubble area
-    # These coordinates are based on the template, so they are fixed
-    omr_area_x, omr_area_y, omr_area_w, omr_area_h = 100, 100, 700, 850
+    # tuned ROI coordinates (same as your app)
+    roi_coords = [
+        (65, 200, 150, 560),  # Python
+        (255, 200, 150, 560), # Data Analysis
+        (445, 200, 150, 560), # MySQL
+        (635, 200, 150, 560), # Power BI
+        (825, 200, 150, 560), # Adv Stats
+    ]
 
-    omr_roi = thresh[omr_area_y:omr_area_y+omr_area_h, omr_area_x:omr_area_x+omr_area_w]
-
-    # Define the grid based on the number of questions and options
-    num_questions = 80
-    num_options = 5
-    num_columns = 2
-    
-    # Calculate the size of each grid cell (bubble)
-    cell_width = omr_roi.shape[1] // (num_options * num_columns)
-    cell_height = omr_roi.shape[0] // (num_questions // num_columns)
-
+    subject_scores = [0, 0, 0, 0, 0]
     student_answers = []
-    
-    for i in range(num_questions):
-        question_answers = []
-        for j in range(num_options):
-            
-            col = i // (num_questions // num_columns)
-            row = i % (num_questions // num_columns)
+    bubble_locations = []  # each entry: {'q_num', 'options': [opt dicts], 'subject'}
 
-            x_start = j * cell_width + col * (omr_roi.shape[1] // num_columns)
-            y_start = row * cell_height
-            
-            bubble_region = omr_roi[y_start:y_start+cell_height, x_start:x_start+cell_width]
-            
-            if bubble_region.size > 0:
-                filled_pixels = cv2.countNonZero(bubble_region)
-                question_answers.append(filled_pixels)
-            else:
-                question_answers.append(0)
+    # Parameters
+    filled_ratio_threshold = 0.25  # adjust if marking is lighter/heavier
 
-        marked_bubble = None
-        if max(question_answers) > 50:
-            marked_bubble = np.argmax(question_answers)
+    for col_idx, (x_offset, y_offset, w, h) in enumerate(roi_coords):
+        subject_roi = thresh[y_offset:y_offset+h, x_offset:x_offset+w]
+        if subject_roi.size == 0:
+            # skip empty ROI
+            continue
 
-        student_answers.append(marked_bubble)
-    
-    score = 0
-    total_questions = len(answer_key)
-    
-    for i in range(total_questions):
-        if i < len(student_answers) and student_answers[i] == answer_key[i]:
-            score += 1
-            
-    return score, student_answers
+        # find contours in ROI
+        contours, _ = cv2.findContours(subject_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw < 6 or bh < 6:
+                continue
+            boxes.append((bx, by, bw, bh))
 
+        if len(boxes) >= 8:
+            # use contour-based detection (robust)
+            # compute medians to guide grouping
+            median_w = int(np.median([b[2] for b in boxes]))
+            median_h = int(np.median([b[3] for b in boxes]))
+            # create centers list
+            centers = []
+            for bx,by,bw,bh in boxes:
+                cx = bx + bw//2
+                cy = by + bh//2
+                centers.append((cx, cy, bx, by, bw, bh))
+            # sort by y
+            centers.sort(key=lambda t: t[1])
+            # group centers into rows using y-distance threshold
+            rows = []
+            if centers:
+                cur_row = [centers[0]]
+                cur_mean_y = centers[0][1]
+                row_thresh = max( int(median_h * 0.8), 8 )
+                for item in centers[1:]:
+                    if abs(item[1] - cur_mean_y) <= row_thresh:
+                        cur_row.append(item)
+                        cur_mean_y = int(np.mean([r[1] for r in cur_row]))
+                    else:
+                        rows.append(cur_row)
+                        cur_row = [item]
+                        cur_mean_y = item[1]
+                rows.append(cur_row)
 
-# --- Streamlit Frontend UI ---
-st.title("Automated OMR Evaluation & Scoring System")
+            # sort rows top-to-bottom, within row sort left-to-right
+            rows_sorted = [sorted(r, key=lambda t: t[0]) for r in rows]
+            rows_sorted.sort(key=lambda r: np.mean([it[1] for it in r]) if r else 0)
 
-st.markdown("""
-Welcome to the OMR Evaluation System!
-Please upload both the answer key, a blank OMR template, and the student's OMR sheet.
-""")
+            # process each row as one question
+            for row in rows_sorted:
+                # choose 4 candidate boxes from row: if more than 4, pick spread-out 4
+                selected = []
+                if len(row) >= 4:
+                    idxs = np.linspace(0, len(row)-1, 4).astype(int)
+                    selected = [row[i] for i in idxs]
+                else:
+                    # fewer than 4; keep what we have and pad later
+                    selected = row[:]
 
-answer_key_file = st.file_uploader("1. Choose the Answer Key file (CSV format)...", type=["csv"])
-template_file = st.file_uploader("2. Upload a **blank OMR sheet photo/scan** (Template)", type=["jpg", "jpeg", "png"])
-omr_sheet_file = st.file_uploader("3. Choose a student's OMR sheet image...", type=["jpg", "jpeg", "png"])
+                # sort by x
+                selected = sorted(selected, key=lambda t: t[0])
+                # pad to 4 options
+                while len(selected) < 4:
+                    selected.append(None)
 
-if answer_key_file is None or template_file is None or omr_sheet_file is None:
-    st.warning("Please upload all three files to continue.")
-else:
-    st.write("---")
-    st.write("Processing files...")
+                # compute filled ratio for each option
+                q_options = []
+                for opt in selected:
+                    if opt is None:
+                        q_options.append({'filled_ratio': 0.0, 'bbox': None, 'center': None})
+                    else:
+                        cx, cy, bx, by, bw, bh = opt
+                        # crop the bubble area from subject_roi
+                        # ensure indices safe
+                        by1, by2 = max(0, by), min(subject_roi.shape[0], by+bh)
+                        bx1, bx2 = max(0, bx), min(subject_roi.shape[1], bx+bw)
+                        bubble_roi = subject_roi[by1:by2, bx1:bx2]
+                        area = (bx2-bx1)*(by2-by1) if (bx2-bx1)*(by2-by1) > 0 else 1
+                        filled = cv2.countNonZero(bubble_roi) if bubble_roi.size > 0 else 0
+                        ratio = filled / area
+                        # convert bbox/cx/cy to global coordinates (in original image)
+                        global_bbox = (x_offset + bx1, y_offset + by1, bx2 - bx1, by2 - by1)
+                        global_center = (x_offset + cx, y_offset + cy)
+                        q_options.append({'filled_ratio': ratio, 'bbox': global_bbox, 'center': global_center})
 
-    try:
-        answer_key = read_answer_key_from_file(answer_key_file)
-        
-        if answer_key is None:
-            st.error("The answer key could not be processed. Please check the file format.")
+                # decide marked bubble
+                ratios = [o['filled_ratio'] for o in q_options]
+                max_ratio = max(ratios)
+                marked = None
+                if max_ratio > filled_ratio_threshold:
+                    marked = int(np.argmax(ratios))
+
+                student_answers.append(marked)
+                bubble_locations.append({
+                    'q_num': len(student_answers),
+                    'options': q_options,
+                    'subject': col_idx
+                })
+
         else:
-            template_bytes = np.asarray(bytearray(template_file.read()), dtype=np.uint8)
-            template_image = cv2.imdecode(template_bytes, 1)
+            # fallback to grid slicing (original approach) but improved with ratios & stored bboxes
+            num_questions = 20
+            cw = w // 4 if w >= 4 else w
+            ch = h // num_questions if h >= num_questions else max(1, h)
+            for q_idx in range(num_questions):
+                q_options = []
+                for opt in range(4):
+                    bx = opt * cw
+                    by = q_idx * ch
+                    bw = cw
+                    bh = ch
+                    by1, by2 = by, min(by+bh, subject_roi.shape[0])
+                    bx1, bx2 = bx, min(bx+bw, subject_roi.shape[1])
+                    bubble_roi = subject_roi[by1:by2, bx1:bx2]
+                    area = (bx2-bx1)*(by2-by1) if (bx2-bx1)*(by2-by1) > 0 else 1
+                    filled = cv2.countNonZero(bubble_roi) if bubble_roi.size > 0 else 0
+                    ratio = filled / area
+                    global_bbox = (x_offset + bx1, y_offset + by1, bx2 - bx1, by2 - by1)
+                    global_center = (x_offset + bx1 + (bx2-bx1)//2, y_offset + by1 + (by2-by1)//2)
+                    q_options.append({'filled_ratio': ratio, 'bbox': global_bbox, 'center': global_center})
 
+                ratios = [o['filled_ratio'] for o in q_options]
+                max_ratio = max(ratios)
+                marked = None
+                if max_ratio > filled_ratio_threshold:
+                    marked = int(np.argmax(ratios))
+                student_answers.append(marked)
+                bubble_locations.append({
+                    'q_num': len(student_answers),
+                    'options': q_options,
+                    'subject': col_idx
+                })
+
+    # scoring
+    for i in range(min(len(answer_key), len(student_answers))):
+        student_mark = student_answers[i]
+        if student_mark is not None and student_mark == answer_key[i]:
+            subj_idx = bubble_locations[i]['subject']
+            if 0 <= subj_idx < len(subject_scores):
+                subject_scores[subj_idx] += 1
+    total_score = sum(subject_scores)
+    return total_score, subject_scores, student_answers, bubble_locations
+
+def generate_visual_overlay(image, bubble_locations, student_answers, answer_key):
+    """Draws precise rectangles around detected bubble bboxes; green if correct, red if wrong.
+       For wrong answers the correct option (if detected) is also highlighted in green."""
+    overlay = image.copy()
+    alpha_draw = overlay  # drawing directly on overlay (no extra transparency required now)
+
+    for i, loc in enumerate(bubble_locations):
+        correct = answer_key[i] if i < len(answer_key) else None
+        marked = student_answers[i] if i < len(student_answers) else None
+
+        # draw selected bubble
+        if marked is not None:
+            opt = loc['options'][marked]
+            bbox = opt.get('bbox')
+            if bbox:
+                bx, by, bw, bh = bbox
+                # shrink a little to avoid touching margins
+                pad_x = max(1, int(bw * 0.12))
+                pad_y = max(1, int(bh * 0.12))
+                tl = (bx + pad_x, by + pad_y)
+                br = (bx + bw - pad_x, by + bh - pad_y)
+                color = (0, 255, 0) if (correct is not None and marked == correct) else (0, 0, 255)
+                cv2.rectangle(alpha_draw, tl, br, color, 2)
+                # optional: small filled circle in center
+                if opt.get('center'):
+                    cx, cy = opt['center']
+                    cv2.circle(alpha_draw, (cx, cy), max(2, int(min(bw, bh) * 0.08)), color, -1)
+
+        # if incorrect, also show where correct bubble was (if detected)
+        if correct is not None and marked is not None and correct != marked:
+            if 0 <= correct < len(loc['options']):
+                corr_opt = loc['options'][correct]
+                corr_bbox = corr_opt.get('bbox')
+                if corr_bbox:
+                    bx, by, bw, bh = corr_bbox
+                    pad_x = max(1, int(bw * 0.12))
+                    pad_y = max(1, int(bh * 0.12))
+                    tl = (bx + pad_x, by + pad_y)
+                    br = (bx + bw - pad_x, by + bh - pad_y)
+                    cv2.rectangle(alpha_draw, tl, br, (0, 255, 0), 2)
+                    if corr_opt.get('center'):
+                        cx, cy = corr_opt['center']
+                        cv2.circle(alpha_draw, (cx, cy), max(2, int(min(bw, bh) * 0.08)), (0, 255, 0), -1)
+
+    return overlay
+
+# --- Frontend UI ---
+st.title("📝 Automated OMR Evaluation & Scoring System")
+st.markdown("Upload an **Answer Key** and a **Student OMR Sheet** to get started.")
+
+# Upload section
+with st.container():
+    st.subheader("📂 Upload Files")
+    col1, col2 = st.columns(2)
+    with col1:
+        answer_key_file = st.file_uploader("Answer Key (CSV)", type=["csv"])
+    with col2:
+        omr_sheet_file = st.file_uploader("OMR Sheet (JPG/PNG)", type=["jpg", "jpeg", "png"])
+    student_id = st.text_input("🆔 Enter Student ID")
+
+if not answer_key_file or not omr_sheet_file or not student_id:
+    st.info("⬆️ Please upload both files and enter Student ID to continue.")
+else:
+    conn, cursor = None, None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        create_table_if_not_exists(conn, cursor)
+
+        answer_key = read_answer_key_from_file(answer_key_file)
+        if answer_key:
             omr_bytes = np.asarray(bytearray(omr_sheet_file.read()), dtype=np.uint8)
-            omr_image = cv2.imdecode(omr_bytes, 1)
+            omr_img = cv2.imdecode(omr_bytes, 1)
 
-            st.image(omr_image, caption='Uploaded Student OMR Sheet', use_column_width=True)
-            st.write("---")
-            
-            aligned_image = preprocess_omr_sheet(omr_image, template_image)
-            
-            if aligned_image is not None:
-                st.image(aligned_image, caption='Aligned and Corrected Image', use_column_width=True)
+            total, subs, stu_ans, bubbles = detect_and_score_omr(preprocess_omr_sheet(omr_img), answer_key)
+            overlay_img = generate_visual_overlay(omr_img, bubbles, stu_ans, answer_key)
 
-                score, answers = detect_and_score_omr(aligned_image, answer_key)
-                
-                st.success("Processing complete!")
-                st.write("---")
-                st.subheader("Results")
-                st.write(f"**Total Score:** {score} out of {len(answer_key)}")
-                
-                st.write("Student Answers:", answers)
-                
-            else:
-                st.error("Could not align the images. Please ensure the template and student sheet are from the same batch.")
-            
+            insert_result(conn, cursor, student_id, total, subs, omr_sheet_file.name)
+
+            # --- Results Display ---
+            st.success("🎉 Processing complete!")
+
+            with st.expander("🔍 Visual Evaluation (click to expand)", expanded=True):
+                st.image(overlay_img, caption="Green = Correct, Red = Incorrect", use_container_width=True)
+
+            st.subheader("📊 Score Breakdown")
+            cols = st.columns(5)
+            subjects = ["Python", "Data Analysis", "MySQL", "Power BI", "Adv Stats"]
+            for idx, col in enumerate(cols):
+                with col:
+                    st.markdown(f"""
+                        <div class="score-card">
+                            <div class="score-title">{subjects[idx]}</div>
+                            <div class="score-value">{subs[idx]} / 20</div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+            st.markdown("---")
+            st.metric("🏆 Total Score", f"{total} / {len(answer_key)}")
+
     except Exception as e:
-        st.error(f"An error occurred during processing: {e}")
+        st.error(f"❌ Error: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
